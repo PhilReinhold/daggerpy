@@ -3,127 +3,205 @@ import sys
 from collections import defaultdict
 from recordtype import recordtype
 
-_curid = 0
-def get_id():
-    global _curid
-    _curid += 1
-    return _curid 
 
-class tac(object):
+class Node(object):
+    _next_id = 0
     def __init__(self, op, srcs):
+        self.id = Node._next_id
+        Node._next_id += 1
         self.op, self.srcs = op, srcs
-        self.dst = get_id()
-        self.dst_scalar, self.srcs_scalar = None, None
-
-    def __repr__(self):
-        return'%s <- %s%s' % (self.dst, self.op, self.srcs)
-
-    @property
-    def id(self):
-        return self.op, self.srcs
-
-    def annotate(self, scalar_refs):
-        self.srcs_scalar = [s in scalar_refs for s in self.srcs]
-        if self.op in ('Mult', 'Add'):
-            self.dst_scalar = all(self.srcs_scalar)
-        else:
-            self.dst_scalar = self.srcs_scalar[0]
-
-        self.validate()
+        self.annotate()
         self.canonicalize()
 
-    def validate(self):
-        if self.op not in ('Add', 'Mult', 'USub', 'sqrt', 'hc', 'tr', 'negate'):
-            raise Exception('Operation %s not yet supported' % self.op)
-        if self.op is 'Add' and self.srcs_scalar[0] != self.srcs_scalar[1]:
-            raise Exception('Trying to add scalar to operator')
-        if self.op is 'sqrt' and not self.srcs_scalar[0]:
-            raise Exception('Operator square root not supported')
-        if self.op is 'tr' and self.self.srcs_scalar[0]:
-            raise Exception('Trying to take trace of scalar')
+    def __repr__(self):
+        scalar_s = "S" if self.scalar else "T"
+        inv_s = "I" if self.inv else "V"
+        srcs_s = "(%s)" % (",".join(str(s.id) for s in self.srcs))
+        return '%s:(%s%s) <- %s%s' % (self.id, scalar_s, inv_s, self.op, srcs_s)
+
+    def repr_tree(self, printed=None):
+        if printed is None:
+            printed = []
+        stmts = []
+        for s in self.srcs:
+            if s not in printed:
+                stmts.append(s.repr_tree(printed))
+        if self not in printed:
+            printed.append(self)
+            stmts.append(str(self))
+        return "\n".join(stmts)
+
+    def __cmp__(self, other):
+        return self.id - other.id
+
+    @property
+    def id_expr(self):
+        return self.op, self.srcs
+
+    def annotate(self):
+        self.scalar = all(s.scalar for s in self.srcs) or self.op == 'tr'
+        self.inv = all(s.inv for s in self.srcs)
+
+        self.unary = len(self.srcs) == 1
+        self.binary = len(self.srcs) == 2
+        self.multivariance = self.binary and self.srcs[0].inv != self.srcs[1].inv
+        if self.multivariance:
+            self.inv_src = [s for s in self.srcs if s.inv][0]
+            self.v_src = [s for s in self.srcs if not s.inv][0]
+            self.associative = self.op in ('Add', 'Mult') and self.op == self.v_src.op
+            self.inv_on_left = self.srcs == (self.inv_src, self.v_src)
+        self.abelian = self.op == 'Add' or (
+            self.op == 'Mult' and any(s.scalar for s in self.srcs)
+        )
 
     def canonicalize(self):
-        abelian = self.op == 'Add'
-        abelian = abelian or (self.op == 'Mult' and any(self.srcs_scalar))
-        if abelian:
+        if self.abelian:
             self.srcs = min(self.srcs), max(self.srcs)
 
-    def rewrite(self, rwdict):
-        self.srcs = tuple(rwdict.get(s, s) for s in self.srcs)
+        if self.multivariance and self.associative and self.v_src.multivariance:
+            i, vi, vv = self.inv_src, self.v_src.inv_src, self.v_src.v_src
+            if self.inv_on_left == self.v_src.inv_on_left or self.v_src.abelian:
+                if self.inv_on_left:
+                    new_node = Node(self.op, (i, vi))
+                    self.srcs = (new_node, vv)
+                else:
+                    new_node = Node(self.op, (vi, i))
+                    self.srcs = (vv, new_node)
+                new_node.scalar = i.scalar and vi.scalar
+                new_node.inv = False
 
-class taccer(object):
-    def __init__(self, string, scalars=None):
-        self.tacs = []
-        self.refd = defaultdict(get_id)
-        self.scalars = scalars if scalars else []
-        self.module2tac(ast.parse(string))
+class NodeSet(dict):
+    def __init__(self):
+        dict.__init__(self)
+        self.order = []
+
+    def __missing__(self, key):
+        n = Node(*key)
+        if n.id_expr in self:
+            n = self[n.id_expr]
+        else:
+            self.order.append(key)
+        self[key] = self[n.id_expr] = n
+        return n
+
+    def __iter__(self):
+        for k in self.order:
+            yield self[k]
+
+class Compiler(object):
+    def __init__(self, string, scalars=None, invariants=None):
+        self.string = string
+        self.nodes = NodeSet()
+        self.assignments = {}
+        self.separated = False
+        self.scalars = default(scalars, [])
+        self.invariants = default(invariants, [])
+
+        Node._next_id = 0
+
+        # Do Everything
+        self.module2node(ast.parse(string))
 
     def __repr__(self):
-        s = "Refs: %s\n" % dict(self.refd)
-        return s + "\n".join(str(t) for t in self.tacs)
+        if self.separated and self.inv_nodes:
+            node_s = "------\n".join(
+                "\n".join(str(t) for t in tl) for tl in (self.inv_nodes, self.v_nodes)
+            )
+        else:
+            node_s = "\n".join(str(t) for t in self.nodes)
+
+        node_s = list(self.assignments.values())[-1].repr_tree()
+
+        return "\n".join([
+            self.string,
+            node_s, ""
+        ])
 
     def dispatch(self, st):
         return {
-            ast.Assign: self.assign2tac,
-            ast.UnaryOp: self.unary2tac,
-            ast.Attribute: self.attr2tac,
-            ast.BinOp: self.binary2tac,
-            ast.Name: lambda x: self.refd[x.id],
+            ast.Assign: self.assign2node,
+            ast.UnaryOp: self.unary2node,
+            ast.Attribute: self.attr2node,
+            ast.BinOp: self.binary2node,
+            ast.Name: self.name2node
         }[type(st)](st)
 
-    def push(self, op, *srcs):
-        t = tac(op, srcs)
-        self.tacs.append(t)
-        return t.dst
+    def put_node(self, op, *srcs):
+        n = self.nodes[(op, srcs)]
+        return n
 
-    def assign2tac(self, st):
-        self.refd[st.targets[0].id] = self.dispatch(st.value)
+    def assign2node(self, st):
+        self.assignments[st.targets[0].id] = self.dispatch(st.value)
 
-    def attr2tac(self, st):
-        return self.push(st.attr, self.dispatch(st.value))
+    def attr2node(self, st):
+        return self.put_node(st.attr, self.dispatch(st.value))
 
-    def unary2tac(self, st):
-        return self.push(
+    def name2node(self, st):
+        n = self.put_node(st.id)
+        n.scalar = st.id in self.scalars
+        n.inv = st.id in self.invariants
+        return n
+
+    def unary2node(self, st):
+        return self.put_node(
             type(st.op).__name__,
             self.dispatch(st.operand)
         )
 
-    def binary2tac(self, st):
-        return self.push(
+    def binary2node(self, st):
+        return self.put_node(
             type(st.op).__name__,
             self.dispatch(st.left),
             self.dispatch(st.right)
         )
     
-    def module2tac(self, module):
+    def module2node(self, module):
         for stmt in module.body:
             self.dispatch(stmt)
 
-        self.annotate()
-        self.sub_exp_elim()
-
-    def annotate(self):
-        annotations = {}
-        scalar_refs = [ref for name, ref in self.refd.items() if name in self.scalars]
-        for t in self.tacs:
-            t.annotate(scalar_refs)
-            if t.dst_scalar:
-                scalar_refs.append(t.dst)
+        #self.annotate()
+        #self.sub_exp_elim()
+        #self.separate_by_variance()
 
     def sub_exp_elim(self):
-        newtacs = []
+        newnodes = []
         seen = {}
         rw = {}
-        for t in self.tacs:
-            t.rewrite(rw)
-            if t.id in seen:
-                rw[t.dst] = seen[t.id]
+        for n in self.nodes:
+            n.rewrite(rw)
+            if n.id_expr in seen:
+                rw[n.dst] = seen[n.id_expr]
             else:
-                seen[t.id] = t.dst
-                newtacs.append(t)
-        self.tacs = newtacs
-               
+                seen[n.id_expr] = n.dst
+                newnodes.append(n)
+        self.nodes = newnodes
+
+    def separate_by_variance(self):
+        self.inv_nodes, self.v_nodes = [], []
+        for n in self.nodes:
+            if n['inv']:
+                self.inv_nodes.append(t)
+            else:
+                self.v_nodes.append(t)
+        self.separated = True
+
+def default(a, v):
+    return a if a else v
+
+def group_list(l, n):
+    nr = len(l) % n
+    rem = l[-nr:] if nr else []
+    return zip(*[iter(l)]*n) + [tuple(rem)]
+                
+def dict_pprint(name, d):
+    ds = ",\n\t".join(
+        ", ".join("%s: %s" % i for i in group) for  group in group_list(d.items(),3)
+    )
+    return "%s{\n\t%s\n}" % (name,  ds)
+
 if __name__ == "__main__":
-    print taccer('z = a*b + b*a')
-    print taccer('z = a*b + b*a', scalars=['a','b'])
-    print taccer('z = c*(a*b + b*a)*d', scalars=['a','b'])
+    print "\n"
+    #print Compiler('z = a*b + b*a')
+    #print Compiler('z = a*b + b*a')
+    #print Compiler('z = a*b + b*a', scalars=['a','b'])
+    print Compiler('z = c*(a.hc*b + b.hc*a)*d', scalars=['c','d'], invariants=['c','d'])
