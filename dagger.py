@@ -159,32 +159,7 @@ class Compiler(object):
         for stmt in module.body:
             self.dispatch(stmt)
 
-        #self.annotate()
-        #self.sub_exp_elim()
-        #self.separate_by_variance()
-
-    def sub_exp_elim(self):
-        newnodes = []
-        seen = {}
-        rw = {}
-        for n in self.nodes:
-            n.rewrite(rw)
-            if n.id_expr in seen:
-                rw[n.dst] = seen[n.id_expr]
-            else:
-                seen[n.id_expr] = n.dst
-                newnodes.append(n)
-        self.nodes = newnodes
-
-    def separate_by_variance(self):
-        self.inv_nodes, self.v_nodes = [], []
-        for n in self.nodes:
-            if n['inv']:
-                self.inv_nodes.append(t)
-            else:
-                self.v_nodes.append(t)
-        self.separated = True
-
+            
 def default(a, v):
     return a if a else v
 
